@@ -1,0 +1,32 @@
+{
+    "sensitive_tables": [
+        "admin",
+        "user",
+        "customer",
+        "client",
+        "member",
+        "account",
+        "profile",
+        "order"
+    ],
+    "sensitive_fields": [
+        "user",
+        "email",
+        "login",
+        "name",
+        "dob",
+        "birth",
+        "ip",
+        "pass",
+        "hash",
+        "zip",
+        "country",
+        "address",
+        "phone",
+        "mobile",
+        "tel",
+        "social",
+        "key",
+        "salt"
+    ]
+}
