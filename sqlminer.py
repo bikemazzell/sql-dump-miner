@@ -450,8 +450,8 @@ if __name__ == "__main__":
                       help='Path to config file (default: config.json)')
     parser.add_argument('-i', '--input', required=True,
                       help='Path to input SQL file')
-    parser.add_argument('-o', '--output', default='sensitive_data.txt',
-                      help='Path to output file (default: sensitive_data.txt)')
+    parser.add_argument('-o', '--output',
+                      help='Path to output file (default: input_filename_out.csv)')
     parser.add_argument('--chunk-size', type=int, default=1000,
                       help='Number of records to process before writing (default: 1000)')
     
@@ -461,6 +461,8 @@ if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = Path(os.path.join(script_dir, args.config))
     input_path = Path(os.path.join(os.getcwd(), args.input))
+    if args.output is None:
+        args.output = input_path.stem + "_out.csv"
     output_path = Path(os.path.join(os.getcwd(), args.output))
 
     try:
