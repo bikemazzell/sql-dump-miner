@@ -11,15 +11,17 @@ class SQLSensitiveDataExtractor:
     A class to extract sensitive data from SQL dump files based on regex patterns.
     """
     
-    def __init__(self, chunk_size: int = 1000):
+    def __init__(self, chunk_size: int = 1000, clean_output: bool = False):
         """
         Initialize the extractor.
         
         Args:
             chunk_size: Number of records to process before writing to file
+            clean_output: Whether to clean the results in-memory.
         """
         self.chunk_size = chunk_size
         self.logger = logging.getLogger(__name__)
+        self.clean_output = clean_output
         
         # Regex for common sensitive data
         email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
@@ -65,36 +67,29 @@ class SQLSensitiveDataExtractor:
             try:
                 with open(input_path, 'r', encoding=encoding) as f:
                     for line in f:
-                        # Use more robust parsing to handle multiple statements per line
-                        if 'insert into' in line.lower() and self.sensitive_pattern.search(line):
-                            # Split by `INSERT INTO` to handle multiple statements on one line
-                            statements = re.split(r'INSERT INTO', line, flags=re.IGNORECASE)
-                            for statement_part in statements[1:]: # First element is before the first insert
-                                try:
-                                    # For each statement, isolate the part after VALUES
-                                    upper_part = statement_part.upper()
-                                    if 'VALUES' not in upper_part:
-                                        continue
-                                    
-                                    values_section = statement_part[upper_part.index('VALUES') + len('VALUES'):]
-                                    
-                                    # Find all individual value tuples, e.g., (...)
-                                    value_tuples = re.findall(r'\((.*?)\)', values_section)
+                        if self.sensitive_pattern.search(line):
+                            # Find all `(...)` tuples on the line. This is more robust
+                            # than looking for INSERT INTO, as it catches multi-line VALUE clauses.
+                            value_tuples = re.findall(r'\((.*?)\)', line)
 
-                                    for v_tuple in value_tuples:
-                                        # Check the specific tuple for sensitive data before adding
-                                        if self.sensitive_pattern.search(v_tuple):
-                                            cleaned_values = v_tuple.replace("'", "").replace('`', '').replace('"', '')
-                                            batch.add(cleaned_values)
+                            for v_tuple in value_tuples:
+                                # Check if the specific tuple contains sensitive data before adding
+                                if self.sensitive_pattern.search(v_tuple):
+                                    raw_values = v_tuple.replace("'", "").replace('`', '').replace('"', '')
+                                    
+                                    if self.clean_output:
+                                        parts = [p for p in raw_values.split(',') if p.strip().lower() not in ['0', '1', 'true', 'false', '', 'null']]
+                                        if parts: # Only add if there's something left after cleaning
+                                            batch.add(','.join(parts))
                                             total_records += 1
-                                            
-                                    if len(batch) >= self.chunk_size:
-                                        self._write_records(batch, write_path)
-                                        batch.clear()
-                                            
-                                except Exception as e:
-                                    self.logger.debug(f"Could not parse values from line snippet: {statement_part[:100]}. Error: {e}")
-                                    continue
+                                    else:
+                                        batch.add(raw_values)
+                                        total_records += 1 # Always add if not cleaning
+                            
+                            # Check batch size after potentially adding new records
+                            if len(batch) >= self.chunk_size:
+                                self._write_records(batch, write_path)
+                                batch.clear()
 
                 self.logger.info(f"Successfully processed file with encoding '{encoding}'.")
                 file_processed = True
@@ -119,44 +114,6 @@ class SQLSensitiveDataExtractor:
             self.logger.info(f"Success! Found {total_records} sensitive data segments. Output written.")
         else:
             self.logger.info("No sensitive data found.")
-
-    def clean_output_file(self, output_path: Path):
-        """
-        Cleans the output file by removing noise like repeated commas and
-        common placeholder values (0, 1, true, false). This is done in-place.
-        """
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            self.logger.warning(f"Output file {output_path} not found or is empty, skipping cleanup.")
-            return
-
-        self.logger.info(f"Cleaning output file: {output_path}")
-        cleaned_temp_path = output_path.with_suffix(output_path.suffix + '.tmp')
-        
-        lines_written = 0
-        try:
-            with open(output_path, 'r', encoding='utf-8') as f_in, \
-                 open(cleaned_temp_path, 'w', encoding='utf-8') as f_out:
-                for line in f_in:
-                    # Split by comma, filter unwanted values, and also filter empty strings
-                    # that result from repeated commas.
-                    parts = [p for p in line.strip().split(',') if p.strip().lower() not in ['0', '1', 'true', 'false', '', 'null']]
-                    if parts:
-                        f_out.write(','.join(parts) + '\n')
-                        lines_written += 1
-            
-            if lines_written > 0:
-                cleaned_temp_path.replace(output_path)
-                self.logger.info(f"Success! Output file cleaned and updated at: {output_path}")
-            else:
-                self.logger.info("Output contained only noise. Final file removed.")
-                output_path.unlink() # Remove original as it's now empty of data
-                
-        except Exception as e:
-            self.logger.error(f"Failed to clean output file: {e}")
-            raise
-        finally:
-            if cleaned_temp_path.exists():
-                cleaned_temp_path.unlink()
 
 def sanitize_filename(name: str) -> str:
     """Sanitizes a string to be used as a valid filename component."""
@@ -190,7 +147,7 @@ if __name__ == "__main__":
     input_path = Path(args.input)
 
     try:
-        extractor = SQLSensitiveDataExtractor(chunk_size=args.chunk_size)
+        extractor = SQLSensitiveDataExtractor(chunk_size=args.chunk_size, clean_output=args.clean)
 
         if input_path.is_dir():
             # --- Batch processing for a directory ---
@@ -220,8 +177,6 @@ if __name__ == "__main__":
                         sanitized_name = sanitize_filename(file_path.stem)
                         output_file = output_dir / f"{sanitized_name}.csv"
                         extractor.process_file(file_path, output_file)
-                        if args.clean:
-                            extractor.clean_output_file(output_file)
                         success_count += 1
                     except Exception as e:
                         logger.error(f"Failed to process file {file_path.name}: {e}", exc_info=args.verbose)
@@ -243,8 +198,6 @@ if __name__ == "__main__":
                     except Exception as e:
                         logger.error(f"Failed to process file {file_path.name}: {e}", exc_info=args.verbose)
                 
-                if args.clean:
-                    extractor.clean_output_file(output_dest)
                 logger.info(f"--- All results combined in {output_dest} ---")
 
         elif input_path.is_file():
@@ -257,8 +210,6 @@ if __name__ == "__main__":
             
             extractor.process_file(input_path, output_path)
 
-            if args.clean:
-                extractor.clean_output_file(output_path)
         else:
             logger.error(f"Input path '{input_path}' is not a valid file or directory.")
             sys.exit(1)
