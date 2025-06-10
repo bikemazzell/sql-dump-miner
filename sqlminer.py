@@ -5,38 +5,88 @@ import re
 import logging
 from pathlib import Path
 from typing import Set
+import time
 
 class SQLSensitiveDataExtractor:
     """
     A class to extract sensitive data from SQL dump files based on regex patterns.
     """
     
-    def __init__(self, chunk_size: int = 1000, clean_output: bool = False):
+    def __init__(self, chunk_size: int = 1000, clean_output: bool = False, verbose: bool = False):
         """
         Initialize the extractor.
         
         Args:
             chunk_size: Number of records to process before writing to file
             clean_output: Whether to clean the results in-memory.
+            verbose: Whether to show detailed progress information
         """
         self.chunk_size = chunk_size
         self.logger = logging.getLogger(__name__)
         self.clean_output = clean_output
+        self.verbose = verbose
         
-        # Regex for common sensitive data
-        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+        # Pre-compile simple, efficient regex patterns
+        # Email: must have @ and domain
+        self.email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+        # IP: exactly 4 groups of 1-3 digits
+        self.ip_pattern = re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
         
-        self.sensitive_pattern = re.compile(f'({email_pattern})|({ip_pattern})', re.IGNORECASE)
+        # Pattern to extract tuple contents efficiently
+        self.tuple_pattern = re.compile(r'\(([^)]+)\)')
+        
+        if self.clean_output:
+            self.noise_values = {'0', '1', 'true', 'false', '', 'null'}
+
+    def _process_line(self, line: str) -> list:
+        """
+        Process a single line and return extracted sensitive data.
+        """
+        results = []
+        
+        # Super fast pre-check - skip lines without @ or multiple dots
+        if '@' not in line and line.count('.') < 3:
+            return results
+        
+        # Find all tuples in the line
+        for match in self.tuple_pattern.finditer(line):
+            tuple_content = match.group(1)
+            
+            # Check for sensitive data
+            has_email = '@' in tuple_content and '.' in tuple_content
+            has_potential_ip = tuple_content.count('.') >= 3 and any(c.isdigit() for c in tuple_content)
+            
+            if not has_email and not has_potential_ip:
+                continue
+            
+            # Now check with regex
+            found_sensitive = False
+            if has_email and self.email_pattern.search(tuple_content):
+                found_sensitive = True
+            elif has_potential_ip and self.ip_pattern.search(tuple_content):
+                found_sensitive = True
+            
+            if found_sensitive:
+                # Clean the content
+                cleaned = tuple_content.replace("'", "").replace('"', '').replace('`', '')
+                
+                if self.clean_output:
+                    parts = [p.strip() for p in cleaned.split(',') 
+                            if p.strip() and p.strip().lower() not in self.noise_values]
+                    if parts:
+                        results.append(','.join(parts))
+                else:
+                    results.append(cleaned)
+        
+        return results
 
     def _write_records(self, records: Set[str], output_path: Path) -> None:
         """
         Appends records to the output file, one record per line.
         """
-        with open(output_path, 'a', encoding='utf-8') as f:
-            # Sort for deterministic output per batch
-            for record in sorted(records):
-                f.write(f"{record}\n")
+        with open(output_path, 'a', encoding='utf-8', buffering=64*1024) as f:
+            # Write all at once for better performance
+            f.write('\n'.join(sorted(records)) + '\n')
 
     def process_file(self, input_path: Path, output_path: Path, append_mode: bool = False) -> None:
         """
@@ -58,44 +108,69 @@ class SQLSensitiveDataExtractor:
         if not append_mode and write_path.exists():
             write_path.unlink()
             
+        # Get file size for progress tracking
+        file_size = input_path.stat().st_size
+        
         total_records = 0
         batch = set()
         encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
         file_processed = False
+        
+        # Progress tracking variables
+        total_lines = 0
+        lines_with_data = 0
+        start_time = time.time()
+        last_report_time = start_time
+        bytes_read = 0
 
         for encoding in encodings:
             try:
-                with open(input_path, 'r', encoding=encoding) as f:
+                # Use large buffer for fast I/O
+                with open(input_path, 'r', encoding=encoding, errors='replace', buffering=8*1024*1024) as f:
                     for line in f:
-                        if self.sensitive_pattern.search(line):
-                            # Find all `(...)` tuples on the line. This is more robust
-                            # than looking for INSERT INTO, as it catches multi-line VALUE clauses.
-                            value_tuples = re.findall(r'\((.*?)\)', line)
-
-                            for v_tuple in value_tuples:
-                                # Check if the specific tuple contains sensitive data before adding
-                                if self.sensitive_pattern.search(v_tuple):
-                                    raw_values = v_tuple.replace("'", "").replace('`', '').replace('"', '')
-                                    
-                                    if self.clean_output:
-                                        parts = [p for p in raw_values.split(',') if p.strip().lower() not in ['0', '1', 'true', 'false', '', 'null']]
-                                        if parts: # Only add if there's something left after cleaning
-                                            batch.add(','.join(parts))
-                                            total_records += 1
-                                    else:
-                                        batch.add(raw_values)
-                                        total_records += 1 # Always add if not cleaning
-                            
-                            # Check batch size after potentially adding new records
-                            if len(batch) >= self.chunk_size:
-                                self._write_records(batch, write_path)
-                                batch.clear()
+                        total_lines += 1
+                        bytes_read += len(line)
+                        
+                        # Process line with optimized method
+                        sensitive_data = self._process_line(line)
+                        if sensitive_data:
+                            lines_with_data += 1
+                            batch.update(sensitive_data)
+                            total_records += len(sensitive_data)
+                        
+                        # Check batch size
+                        if len(batch) >= self.chunk_size:
+                            self._write_records(batch, write_path)
+                            batch.clear()
+                        
+                        # Progress report every 2 seconds in verbose mode
+                        if self.verbose:
+                            current_time = time.time()
+                            if current_time - last_report_time >= 2:
+                                elapsed = current_time - start_time
+                                progress = (bytes_read / file_size) * 100 if file_size > 0 else 0
+                                rate = bytes_read / elapsed / 1024 / 1024 if elapsed > 0 else 0
+                                lines_per_sec = total_lines / elapsed if elapsed > 0 else 0
+                                
+                                self.logger.info(
+                                    f"Progress: {progress:.1f}% | "
+                                    f"Lines: {total_lines:,} ({lines_per_sec:.0f}/sec) | "
+                                    f"Found: {total_records:,} | "
+                                    f"Rate: {rate:.1f} MB/s"
+                                )
+                                last_report_time = current_time
 
                 self.logger.info(f"Successfully processed file with encoding '{encoding}'.")
                 file_processed = True
                 break
             except UnicodeDecodeError:
                 self.logger.debug(f"Failed to decode with {encoding}, trying next.")
+                # Reset counters for next encoding attempt
+                total_lines = 0
+                total_records = 0
+                lines_with_data = 0
+                bytes_read = 0
+                batch.clear()
                 continue
             except Exception as e:
                 self.logger.error(f"Error reading file {input_path} with encoding {encoding}: {e}")
@@ -109,11 +184,23 @@ class SQLSensitiveDataExtractor:
             
         if not append_mode and write_path.exists():
             write_path.replace(output_path)
-            
-        if total_records > 0:
-            self.logger.info(f"Success! Found {total_records} sensitive data segments. Output written.")
+        
+        # Final statistics
+        elapsed = time.time() - start_time
+        if self.verbose:
+            self.logger.info(f"\n{'='*60}")
+            self.logger.info(f"Processing complete in {elapsed:.1f} seconds")
+            self.logger.info(f"Total lines processed: {total_lines:,}")
+            self.logger.info(f"Lines with sensitive data: {lines_with_data:,}")
+            self.logger.info(f"Total records extracted: {total_records:,}")
+            if elapsed > 0:
+                self.logger.info(f"Average speed: {total_lines/elapsed:.0f} lines/sec, {file_size/elapsed/1024/1024:.1f} MB/s")
+            self.logger.info(f"{'='*60}")
         else:
-            self.logger.info("No sensitive data found.")
+            if total_records > 0:
+                self.logger.info(f"Success! Found {total_records} sensitive data segments. Output written.")
+            else:
+                self.logger.info("No sensitive data found.")
 
 def sanitize_filename(name: str) -> str:
     """Sanitizes a string to be used as a valid filename component."""
@@ -147,7 +234,7 @@ if __name__ == "__main__":
     input_path = Path(args.input)
 
     try:
-        extractor = SQLSensitiveDataExtractor(chunk_size=args.chunk_size, clean_output=args.clean)
+        extractor = SQLSensitiveDataExtractor(chunk_size=args.chunk_size, clean_output=args.clean, verbose=args.verbose)
 
         if input_path.is_dir():
             # --- Batch processing for a directory ---
